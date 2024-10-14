@@ -17,6 +17,7 @@ import time
 import itertools
 import copy
 import tempfile
+import sonic_yang
 
 from jsonpatch import JsonPatchConflict
 from jsonpointer import JsonPointerException
@@ -42,6 +43,7 @@ from utilities_common.helper import get_port_pbh_binding, get_port_acl_binding, 
 from utilities_common.general import load_db_config, load_module_from_source
 from .validated_config_db_connector import ValidatedConfigDBConnector
 import utilities_common.multi_asic as multi_asic_util
+from utilities_common.flock import try_lock
 
 from .utils import log
 
@@ -58,7 +60,7 @@ from . import nat
 from . import vlan
 from . import vxlan
 from . import plugins
-from .config_mgmt import ConfigMgmtDPB, ConfigMgmt
+from .config_mgmt import ConfigMgmtDPB, ConfigMgmt, YANG_DIR
 from . import mclag
 from . import syslog
 from . import switchport
@@ -123,6 +125,12 @@ TTL_RANGE = click.IntRange(min=0, max=255)
 QUEUE_RANGE = click.IntRange(min=0, max=255)
 GRE_TYPE_RANGE = click.IntRange(min=0, max=65535)
 ADHOC_VALIDATION = True
+
+if os.environ.get("UTILITIES_UNIT_TESTING", "0") in ("1", "2"):
+    temp_system_reload_lockfile = tempfile.NamedTemporaryFile()
+    SYSTEM_RELOAD_LOCK = temp_system_reload_lockfile.name
+else:
+    SYSTEM_RELOAD_LOCK = "/etc/sonic/reload.lock"
 
 # Load sonic-cfggen from source since /usr/local/bin/sonic-cfggen does not have .py extension.
 sonic_cfggen = load_module_from_source('sonic_cfggen', '/usr/local/bin/sonic-cfggen')
@@ -1753,9 +1761,11 @@ def list_checkpoints(ctx, verbose):
 @click.option('-n', '--no_service_restart', default=False, is_flag=True, help='Do not restart docker services')
 @click.option('-f', '--force', default=False, is_flag=True, help='Force config reload without system checks')
 @click.option('-t', '--file_format', default='config_db',type=click.Choice(['config_yang', 'config_db']),show_default=True,help='specify the file format')
+@click.option('-b', '--bypass-lock', default=False, is_flag=True, help='Do reload without acquiring lock')
 @click.argument('filename', required=False)
 @clicommon.pass_db
-def reload(db, filename, yes, load_sysinfo, no_service_restart, force, file_format):
+@try_lock(SYSTEM_RELOAD_LOCK, timeout=0)
+def reload(db, filename, yes, load_sysinfo, no_service_restart, force, file_format, bypass_lock):
     """Clear current configuration and import a previous saved config DB dump file.
        <filename> : Names of configuration file(s) to load, separated by comma with no spaces in between
     """
@@ -1968,8 +1978,10 @@ def load_mgmt_config(filename):
 @click.option('-t', '--traffic_shift_away', default=False, is_flag=True, help='Keep device in maintenance with TSA')
 @click.option('-o', '--override_config', default=False, is_flag=True, help='Enable config override. Proceed with default path.')
 @click.option('-p', '--golden_config_path', help='Provide golden config path to override. Use with --override_config')
+@click.option('-b', '--bypass-lock', default=False, is_flag=True, help='Do load minigraph without acquiring lock')
 @clicommon.pass_db
-def load_minigraph(db, no_service_restart, traffic_shift_away, override_config, golden_config_path):
+@try_lock(SYSTEM_RELOAD_LOCK, timeout=0)
+def load_minigraph(db, no_service_restart, traffic_shift_away, override_config, golden_config_path, bypass_lock):
     """Reconfigure based on minigraph."""
     argv_str = ' '.join(['config', *sys.argv[1:]])
     log.log_notice(f"'load_minigraph' executing with command: {argv_str}")
@@ -1983,8 +1995,22 @@ def load_minigraph(db, no_service_restart, traffic_shift_away, override_config, 
                         fg='magenta')
             raise click.Abort()
 
-        # Dependency check golden config json
         config_to_check = read_json_file(golden_config_path)
+        if multi_asic.is_multi_asic():
+            # Multiasic has not 100% fully validated. Thus pass here.
+            pass
+        else:
+            sy = sonic_yang.SonicYang(YANG_DIR)
+            sy.loadYangModel()
+            try:
+                sy.loadData(configdbJson=config_to_check)
+                sy.validate_data_tree()
+            except sonic_yang.SonicYangException as e:
+                click.secho("{} fails YANG validation! Error: {}".format(golden_config_path, str(e)),
+                            fg='magenta')
+                raise click.Abort()
+
+        # Dependency check golden config json
         if multi_asic.is_multi_asic():
             host_config = config_to_check.get('localhost', {})
         else:
@@ -2311,7 +2337,7 @@ def aaa_table_hard_dependency_check(config_json):
     tacacs_enable = "tacacs+" in aaa_authentication_login.split(",")
     tacplus_passkey = TACPLUS_TABLE.get("global", {}).get("passkey", "")
     if tacacs_enable and len(tacplus_passkey) == 0:
-        click.secho("Authentication with 'tacacs+' is not allowed when passkey not exits.", fg="magenta")
+        click.secho("Authentication with 'tacacs+' is not allowed when passkey not exists.", fg="magenta")
         sys.exit(1)
 
 
@@ -2364,6 +2390,20 @@ def synchronous_mode(sync_mode):
     Option 1. config save -y \n
               config reload -y \n
     Option 2. systemctl restart swss""" % sync_mode)
+
+
+#
+# 'suppress-fib-pending' command ('config suppress-fib-pending ...')
+#
+@config.command('suppress-fib-pending')
+@click.argument('state', metavar='<enabled|disabled>', required=True, type=click.Choice(['enabled', 'disabled']))
+@clicommon.pass_db
+def suppress_pending_fib(db, state):
+    ''' Enable or disable pending FIB suppression. Once enabled,
+        BGP will not advertise routes that are not yet installed in the hardware '''
+
+    config_db = db.cfgdb
+    config_db.mod_entry('DEVICE_METADATA', 'localhost', {"suppress-fib-pending": state})
 
 #
 # 'yang_config_validation' command ('config yang_config_validation ...')
@@ -3116,7 +3156,7 @@ def reload(ctx, no_dynamic_buffer, no_delay, dry_run, json_data, ports, verbose)
 
     _, hwsku_path = device_info.get_paths_to_platform_and_hwsku_dirs()
     sonic_version_file = device_info.get_sonic_version_file()
-    from_db = ['-d', '--write-to-db']
+    from_db = ['-d']
     if dry_run:
         from_db = ['--additional-data'] + [str(json_data)] if json_data else []
 
@@ -3162,11 +3202,27 @@ def reload(ctx, no_dynamic_buffer, no_delay, dry_run, json_data, ports, verbose)
             )
             if os.path.isfile(qos_template_file):
                 cmd_ns = [] if ns is DEFAULT_NAMESPACE else ['-n', str(ns)]
-                fname = "{}{}".format(dry_run, asic_id_suffix) if dry_run else "config-db"
-                command = [SONIC_CFGGEN_PATH] + cmd_ns + from_db + ['-t', '{},{}'.format(buffer_template_file, fname), '-t', '{},{}'.format(qos_template_file, fname), '-y', sonic_version_file]
-                # Apply the configurations only when both buffer and qos
-                # configuration files are present
+                buffer_fname = "/tmp/cfg_buffer{}.json".format(asic_id_suffix)
+                qos_fname = "/tmp/cfg_qos{}.json".format(asic_id_suffix)
+
+                command = [SONIC_CFGGEN_PATH] + cmd_ns + from_db + [
+                    '-t', '{},{}'.format(buffer_template_file, buffer_fname),
+                    '-t', '{},{}'.format(qos_template_file, qos_fname),
+                    '-y', sonic_version_file
+                ]
                 clicommon.run_command(command, display_cmd=True)
+
+                command = [SONIC_CFGGEN_PATH] + cmd_ns + ["-j", buffer_fname, "-j", qos_fname]
+                if dry_run:
+                    out, rc = clicommon.run_command(command + ["--print-data"], display_cmd=True, return_cmd=True)
+                    if rc != 0:
+                        # clicommon.run_command does this by default when rc != 0 and return_cmd=False
+                        sys.exit(rc)
+                    with open("{}{}".format(dry_run, asic_id_suffix), 'w') as f:
+                        json.dump(json.loads(out), f, sort_keys=True, indent=4)
+                else:
+                    clicommon.run_command(command + ["--write-to-db"], display_cmd=True)
+
             else:
                 click.secho("QoS definition template not found at {}".format(
                     qos_template_file
@@ -6388,7 +6444,8 @@ def remove_reasons(counter_name, reasons, verbose):
 @click.option('-ydrop', metavar='<yellow drop probability>', type=click.IntRange(0, 100), help="Set yellow drop probability")
 @click.option('-gdrop', metavar='<green drop probability>', type=click.IntRange(0, 100), help="Set green drop probability")
 @click.option('-v', '--verbose', is_flag=True, help="Enable verbose output")
-def ecn(profile, rmax, rmin, ymax, ymin, gmax, gmin, rdrop, ydrop, gdrop, verbose):
+@multi_asic_util.multi_asic_click_option_namespace
+def ecn(profile, rmax, rmin, ymax, ymin, gmax, gmin, rdrop, ydrop, gdrop, verbose, namespace):
     """ECN-related configuration tasks"""
     log.log_info("'ecn -profile {}' executing...".format(profile))
     command = ['ecnconfig', '-p', str(profile)]
@@ -6402,6 +6459,8 @@ def ecn(profile, rmax, rmin, ymax, ymin, gmax, gmin, rdrop, ydrop, gdrop, verbos
     if ydrop is not None: command += ['-ydrop', str(ydrop)]
     if gdrop is not None: command += ['-gdrop', str(gdrop)]
     if verbose: command += ["-vv"]
+    if namespace is not None:
+        command += ['-n', str(namespace)]
     clicommon.run_command(command, display_cmd=verbose)
 
 
@@ -6411,13 +6470,26 @@ def ecn(profile, rmax, rmin, ymax, ymin, gmax, gmin, rdrop, ydrop, gdrop, verbos
 @config.command()
 @click.option('-p', metavar='<profile_name>', type=str, required=True, help="Profile name")
 @click.option('-a', metavar='<alpha>', type=click.IntRange(-8,8), help="Set alpha for profile type dynamic")
-@click.option('-s', metavar='<staticth>', type=int, help="Set staticth for profile type static")
-def mmu(p, a, s):
+@click.option('-s', metavar='<staticth>', type=click.IntRange(min=0), help="Set staticth for profile type static")
+@click.option('--verbose', '-vv', is_flag=True, help="Enable verbose output")
+@click.option('--namespace',
+              '-n',
+              'namespace',
+              default=None,
+              type=str,
+              show_default=True,
+              help='Namespace name or all',
+              callback=multi_asic_util.multi_asic_namespace_validation_callback)
+def mmu(p, a, s, namespace, verbose):
     """mmuconfig configuration tasks"""
     log.log_info("'mmuconfig -p {}' executing...".format(p))
     command = ['mmuconfig', '-p', str(p)]
     if a is not None: command += ['-a', str(a)]
     if s is not None: command += ['-s', str(s)]
+    if namespace is not None:
+        command += ['-n', str(namespace)]
+    if verbose:
+        command += ['-vv']
     clicommon.run_command(command)
 
 
@@ -6439,8 +6511,9 @@ def pfc(ctx):
 @pfc.command()
 @click.argument('interface_name', metavar='<interface_name>', required=True)
 @click.argument('status', type=click.Choice(['on', 'off']))
+@multi_asic_util.multi_asic_click_option_namespace
 @click.pass_context
-def asymmetric(ctx, interface_name, status):
+def asymmetric(ctx, interface_name, status, namespace):
     """Set asymmetric PFC configuration."""
     # Get the config_db connector
     config_db = ctx.obj['config_db']
@@ -6450,7 +6523,11 @@ def asymmetric(ctx, interface_name, status):
         if interface_name is None:
             ctx.fail("'interface_name' is None!")
 
-    clicommon.run_command(['pfc', 'config', 'asymmetric', str(status), str(interface_name)])
+    cmd = ['pfc', 'config', 'asymmetric', str(status), str(interface_name)]
+    if namespace is not None:
+        cmd += ['-n', str(namespace)]
+
+    clicommon.run_command(cmd)
 
 #
 # 'pfc priority' command ('config interface pfc priority ...')
@@ -6460,8 +6537,9 @@ def asymmetric(ctx, interface_name, status):
 @click.argument('interface_name', metavar='<interface_name>', required=True)
 @click.argument('priority', type=click.Choice([str(x) for x in range(8)]))
 @click.argument('status', type=click.Choice(['on', 'off']))
+@multi_asic_util.multi_asic_click_option_namespace
 @click.pass_context
-def priority(ctx, interface_name, priority, status):
+def priority(ctx, interface_name, priority, status, namespace):
     """Set PFC priority configuration."""
     # Get the config_db connector
     config_db = ctx.obj['config_db']
@@ -6471,7 +6549,11 @@ def priority(ctx, interface_name, priority, status):
         if interface_name is None:
             ctx.fail("'interface_name' is None!")
 
-    clicommon.run_command(['pfc', 'config', 'priority', str(status), str(interface_name), str(priority)])
+    cmd = ['pfc', 'config', 'priority', str(status), str(interface_name), str(priority)]
+    if namespace is not None:
+        cmd += ['-n', str(namespace)]
+
+    clicommon.run_command(cmd)
 
 #
 # 'buffer' group ('config buffer ...')
@@ -7903,6 +7985,72 @@ def warning(db, category_list, max_events, namespace):
 @clicommon.pass_db
 def notice(db, category_list, max_events, namespace):
     handle_asic_sdk_health_suppress(db, 'notice', category_list, max_events, namespace)
+
+
+#
+# 'serial_console' group ('config  serial_console')
+#
+@config.group(cls=clicommon.AbbreviationGroup, name='serial_console')
+def serial_console():
+    """Configuring system serial-console behavior"""
+    pass
+
+
+@serial_console.command('sysrq-capabilities')
+@click.argument('sysrq_capabilities', metavar='<enabled|disabled>', required=True,
+                type=click.Choice(['enabled', 'disabled']))
+def sysrq_capabilities(sysrq_capabilities):
+    """Set serial console sysrq-capabilities state"""
+
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    config_db.mod_entry("SERIAL_CONSOLE", 'POLICIES',
+                        {'sysrq_capabilities': sysrq_capabilities})
+
+
+@serial_console.command('inactivity-timeout')
+@click.argument('inactivity_timeout', metavar='<timeout>', required=True,
+                type=click.IntRange(0, 35000))
+def inactivity_timeout_serial(inactivity_timeout):
+    """Set serial console inactivity timeout"""
+
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    config_db.mod_entry("SERIAL_CONSOLE", 'POLICIES',
+                        {'inactivity_timeout': inactivity_timeout})
+
+
+#
+# 'ssh' group ('config  ssh')
+#
+@config.group(cls=clicommon.AbbreviationGroup, name='ssh')
+def ssh():
+    """Configuring system ssh behavior"""
+    pass
+
+
+@ssh.command('inactivity-timeout')
+@click.argument('inactivity_timeout', metavar='<timeout>', required=True,
+                type=click.IntRange(0, 35000))
+def inactivity_timeout_ssh(inactivity_timeout):
+    """Set ssh inactivity timeout"""
+
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    config_db.mod_entry("SSH_SERVER", 'POLICIES',
+                        {'inactivity_timeout': inactivity_timeout})
+
+
+@ssh.command('max-sessions')
+@click.argument('max-sessions', metavar='<max-sessions>', required=True,
+                type=click.IntRange(0, 100))
+def max_sessions(max_sessions):
+    """Set max number of concurrent logins"""
+
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    config_db.mod_entry("SSH_SERVER", 'POLICIES',
+                        {'max_sessions': max_sessions})
 
 
 if __name__ == '__main__':
