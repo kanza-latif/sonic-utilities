@@ -19,16 +19,14 @@ from show.memory_statistics import (
 )
 
 
-class TestMemoryStatisticsConfig:
-    def test_display_config_full_configuration(self, mocker):
-        """
-        Test displaying a fully configured memory statistics configuration
-        """
+class TestMemoryStatisticsConfig(unittest.TestCase):
+    def test_display_config_success(self, mocker):
+        """Test successful configuration display"""
+        # Mock syslog
+        mock_syslog = mocker.patch('syslog.syslog')
+
         # Mock click.echo
         mock_echo = mocker.patch('click.echo')
-
-        # Mock syslog to prevent actual logging
-        mock_syslog = mocker.patch('syslog.syslog')
 
         # Create a mock SonicDBConnector
         mock_db_connector = MagicMock()
@@ -49,20 +47,62 @@ class TestMemoryStatisticsConfig:
             call(f"{'Retention Time (days)':<30}7"),
             call(f"{'Sampling Interval (minutes)':<30}5")
         ]
-        mock_echo.assert_has_calls(expected_calls, any_order=False)
-
-        # Ensure no syslog calls for successful configuration
+        mock_echo.assert_has_calls(expected_calls)
         mock_syslog.assert_not_called()
 
-    def test_display_config_partial_configuration(self, mocker):
-        """
-        Test displaying a partially configured memory statistics configuration
-        """
+    def test_display_config_default_values(self, mocker):
+        """Test configuration display with default/missing values"""
+        # Mock syslog
+        mock_syslog = mocker.patch('syslog.syslog')
+
         # Mock click.echo
         mock_echo = mocker.patch('click.echo')
 
-        # Mock syslog to prevent actual logging
+        # Create a mock SonicDBConnector
+        mock_db_connector = MagicMock()
+        mock_db_connector.get_memory_statistics_config.return_value = {}
+
+        # Call the function
+        display_config(mock_db_connector)
+
+        # Assert echo calls
+        expected_calls = [
+            call(f"{'Configuration Field':<30}{'Value'}"),
+            call("-" * 50),
+            call(f"{'Enabled':<30}Not configured"),
+            call(f"{'Retention Time (days)':<30}Not configured"),
+            call(f"{'Sampling Interval (minutes)':<30}Not configured")
+        ]
+        mock_echo.assert_has_calls(expected_calls)
+        mock_syslog.assert_not_called()
+
+    def test_display_config_exception(self, mocker):
+        """Test configuration display when an exception occurs"""
+        # Mock syslog
         mock_syslog = mocker.patch('syslog.syslog')
+
+        # Create a mock SonicDBConnector that raises an exception
+        mock_db_connector = MagicMock()
+        mock_db_connector.get_memory_statistics_config.side_effect = Exception("Database error")
+
+        # Assert that a ClickException is raised
+        with pytest.raises(click.ClickException) as context:
+            display_config(mock_db_connector)
+
+        # Check the error message and syslog
+        assert "Failed to retrieve configuration: Database error" in str(context.value)
+        mock_syslog.assert_called_once_with(
+            syslog.LOG_ERR,
+            "Failed to retrieve configuration: Database error"
+        )
+
+    def test_display_config_partial_config(self, mocker):
+        """Test configuration display with partial configuration"""
+        # Mock syslog
+        mock_syslog = mocker.patch('syslog.syslog')
+
+        # Mock click.echo
+        mock_echo = mocker.patch('click.echo')
 
         # Create a mock SonicDBConnector
         mock_db_connector = MagicMock()
@@ -82,211 +122,21 @@ class TestMemoryStatisticsConfig:
             call(f"{'Retention Time (days)':<30}Not configured"),
             call(f"{'Sampling Interval (minutes)':<30}Not configured")
         ]
-        mock_echo.assert_has_calls(expected_calls, any_order=False)
-
-        # Ensure no syslog calls for partial configuration
+        mock_echo.assert_has_calls(expected_calls)
         mock_syslog.assert_not_called()
 
-    def test_display_config_empty_configuration(self, mocker):
-        """
-        Test displaying an empty memory statistics configuration
-        """
-        # Mock click.echo
-        mock_echo = mocker.patch('click.echo')
-
-        # Mock syslog to prevent actual logging
-        mock_syslog = mocker.patch('syslog.syslog')
-
-        # Create a mock SonicDBConnector
-        mock_db_connector = MagicMock()
-        mock_db_connector.get_memory_statistics_config.return_value = {}
-
-        # Call the function
-        display_config(mock_db_connector)
-
-        # Assert echo calls
-        expected_calls = [
-            call(f"{'Configuration Field':<30}{'Value'}"),
-            call("-" * 50),
-            call(f"{'Enabled':<30}Not configured"),
-            call(f"{'Retention Time (days)':<30}Not configured"),
-            call(f"{'Sampling Interval (minutes)':<30}Not configured")
-        ]
-        mock_echo.assert_has_calls(expected_calls, any_order=False)
-
-        # Ensure no syslog calls for empty configuration
-        mock_syslog.assert_not_called()
-
-    def test_display_config_exception_handling(self, mocker):
-        """
-        Test error handling when retrieving configuration fails
-        """
-        # Mock syslog
-        mock_syslog = mocker.patch('syslog.syslog')
-
-        # Create a mock SonicDBConnector that raises an exception
-        mock_db_connector = MagicMock()
-        mock_db_connector.get_memory_statistics_config.side_effect = Exception("Database error")
-
-        # Assert that a ClickException is raised
-        with pytest.raises(click.ClickException) as excinfo:
-            display_config(mock_db_connector)
-
-        # Check the error message
-        assert "Failed to retrieve configuration: Database error" in str(excinfo.value)
-
-        # Verify syslog was called with the error
-        mock_syslog.assert_called_once_with(
-            syslog.LOG_ERR,
-            "Failed to retrieve configuration: Database error"
-        )
-
-    def test_format_field_value(self):
-        """
-        Test the format_field_value helper function
-        """
-        # Test enabled field
-        assert format_field_value("enabled", "true") == "True"
-        assert format_field_value("enabled", "false") == "False"
-
-        # Test other fields
-        assert format_field_value("retention_period", "7") == "7"
-        assert format_field_value("retention_period", "Unknown") == "Not configured"
-
-        # Test sampling interval
-        assert format_field_value("sampling_interval", "5") == "5"
-        assert format_field_value("sampling_interval", "Unknown") == "Not configured"
-
-
-# Additional setup for pytest
-def pytest_configure(config):
-    """
-    Allows plugins and fixtures to be configured for pytest.
-    """
-    config.addinivalue_line(
-        "markers",
-        "unit: mark a test as a unit test."
-    )
-
-# class TestMemoryStatisticsConfig:
-#     def test_display_config_success(self, mocker):
-#         """Test successful configuration display"""
-#         # Mock syslog
-#         mock_syslog = mocker.patch('syslog.syslog')
-
-#         # Mock click.echo
-#         mock_echo = mocker.patch('click.echo')
-
-#         # Create a mock SonicDBConnector
-#         mock_db_connector = MagicMock()
-#         mock_db_connector.get_memory_statistics_config.return_value = {
-#             "enabled": "true",
-#             "retention_period": "7",
-#             "sampling_interval": "5"
-#         }
-
-#         # Call the function
-#         display_config(mock_db_connector)
-
-#         # Assert echo calls
-#         expected_calls = [
-#             call(f"{'Configuration Field':<30}{'Value'}"),
-#             call("-" * 50),
-#             call(f"{'Enabled':<30}True"),
-#             call(f"{'Retention Time (days)':<30}7"),
-#             call(f"{'Sampling Interval (minutes)':<30}5")
-#         ]
-#         mock_echo.assert_has_calls(expected_calls)
-#         mock_syslog.assert_not_called()
-
-#     def test_display_config_default_values(self, mocker):
-#         """Test configuration display with default/missing values"""
-#         # Mock syslog
-#         mock_syslog = mocker.patch('syslog.syslog')
-
-#         # Mock click.echo
-#         mock_echo = mocker.patch('click.echo')
-
-#         # Create a mock SonicDBConnector
-#         mock_db_connector = MagicMock()
-#         mock_db_connector.get_memory_statistics_config.return_value = {}
-
-#         # Call the function
-#         display_config(mock_db_connector)
-
-#         # Assert echo calls
-#         expected_calls = [
-#             call(f"{'Configuration Field':<30}{'Value'}"),
-#             call("-" * 50),
-#             call(f"{'Enabled':<30}Not configured"),
-#             call(f"{'Retention Time (days)':<30}Not configured"),
-#             call(f"{'Sampling Interval (minutes)':<30}Not configured")
-#         ]
-#         mock_echo.assert_has_calls(expected_calls)
-#         mock_syslog.assert_not_called()
-
-#     def test_display_config_exception(self, mocker):
-#         """Test configuration display when an exception occurs"""
-#         # Mock syslog
-#         mock_syslog = mocker.patch('syslog.syslog')
-
-#         # Create a mock SonicDBConnector that raises an exception
-#         mock_db_connector = MagicMock()
-#         mock_db_connector.get_memory_statistics_config.side_effect = Exception("Database error")
-
-#         # Assert that a ClickException is raised
-#         with pytest.raises(click.ClickException) as context:
-#             display_config(mock_db_connector)
-
-#         # Check the error message and syslog
-#         assert "Failed to retrieve configuration: Database error" in str(context.value)
-#         mock_syslog.assert_called_once_with(
-#             syslog.LOG_ERR,
-#             "Failed to retrieve configuration: Database error"
-#         )
-
-#     def test_display_config_partial_config(self, mocker):
-#         """Test configuration display with partial configuration"""
-#         # Mock syslog
-#         mock_syslog = mocker.patch('syslog.syslog')
-
-#         # Mock click.echo
-#         mock_echo = mocker.patch('click.echo')
-
-#         # Create a mock SonicDBConnector
-#         mock_db_connector = MagicMock()
-#         mock_db_connector.get_memory_statistics_config.return_value = {
-#             "enabled": "false",
-#             "retention_period": "Unknown"
-#         }
-
-#         # Call the function
-#         display_config(mock_db_connector)
-
-#         # Assert echo calls
-#         expected_calls = [
-#             call(f"{'Configuration Field':<30}{'Value'}"),
-#             call("-" * 50),
-#             call(f"{'Enabled':<30}False"),
-#             call(f"{'Retention Time (days)':<30}Not configured"),
-#             call(f"{'Sampling Interval (minutes)':<30}Not configured")
-#         ]
-#         mock_echo.assert_has_calls(expected_calls)
-#         mock_syslog.assert_not_called()
-
-# class TestConfig(unittest.TestCase):
-#     """Test cases for Config class"""
-#     def test_default_values(self):
-#         """Test if Config class has correct default values"""
-#         self.assertEqual(Config.SOCKET_PATH, '/var/run/dbus/memstats.socket')
-#         self.assertEqual(Config.SOCKET_TIMEOUT, 30)
-#         self.assertEqual(Config.BUFFER_SIZE, 8192)
-#         self.assertEqual(Config.MAX_RETRIES, 3)
-#         self.assertEqual(Config.RETRY_DELAY, 1.0)
-#         self.assertEqual(Config.DEFAULT_CONFIG["enabled"], "false")
-#         self.assertEqual(Config.DEFAULT_CONFIG["retention_period"], "Unknown")
-#         self.assertEqual(Config.DEFAULT_CONFIG["sampling_interval"], "Unknown")
-
+class TestConfig(unittest.TestCase):
+    """Test cases for Config class"""
+    def test_default_values(self):
+        """Test if Config class has correct default values"""
+        self.assertEqual(Config.SOCKET_PATH, '/var/run/dbus/memstats.socket')
+        self.assertEqual(Config.SOCKET_TIMEOUT, 30)
+        self.assertEqual(Config.BUFFER_SIZE, 8192)
+        self.assertEqual(Config.MAX_RETRIES, 3)
+        self.assertEqual(Config.RETRY_DELAY, 1.0)
+        self.assertEqual(Config.DEFAULT_CONFIG["enabled"], "false")
+        self.assertEqual(Config.DEFAULT_CONFIG["retention_period"], "Unknown")
+        self.assertEqual(Config.DEFAULT_CONFIG["sampling_interval"], "Unknown")
 
 class TestDict2Obj(unittest.TestCase):
     """Test cases for Dict2Obj class"""
